@@ -8,8 +8,8 @@ PORT = 5000
 
 class BootstrapServer:
     def __init__(self):
-        self.peers = {} # Lưu trạng thái (ip, port) -> last_heartbeat
-        self.groups = {} # Lưu trạng thái nhóm: group_name -> (leader_ip, leader_port)
+        self.peers = {} 
+        self.groups = {} 
         self.lock = threading.Lock()
 
     def handle_client(self, conn, addr):
@@ -18,7 +18,6 @@ class BootstrapServer:
             if not data: return
             msg = json.loads(data)
             
-            # Yêu cầu 3.1 & 3.5: Đăng ký mạng và cập nhật trạng thái Online
             peer_port = msg.get('port')
             peer_addr = (addr[0], peer_port)
             
@@ -42,17 +41,14 @@ class BootstrapServer:
         active = []
         active_groups = {}
         with self.lock:
-            # Yêu cầu 3.5: Cập nhật trạng thái rời mạng (Xóa các peer không gửi heartbeat > 15s)
             stale_peers = [p for p, ts in self.peers.items() if current_time - ts > 15]
             for p in stale_peers:
                 del self.peers[p]
-                # Xóa các nhóm mà peer này làm leader
                 stale_groups = [g for g, leader in self.groups.items() if leader == p]
                 for g in stale_groups:
                     del self.groups[g]
                 print(f"[-] Peer {p} đã offline (timeout).")
             
-            # Yêu cầu 3.4: Trả về danh sách Peer Discovery
             for p in self.peers:
                 active.append({'ip': p[0], 'port': p[1]})
             active_groups = {g: [l[0], l[1]] for g, l in self.groups.items()}
