@@ -3,6 +3,7 @@ import threading
 import json
 import time
 import sys
+import uuid
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
 import queue
@@ -20,6 +21,45 @@ class Peer:
         self.lock = threading.Lock()
         self.ui_queue = ui_queue
 
+    def _make_message(self, msg_type, content="", group_name=None, **extra_fields):
+        payload = {
+            'type': msg_type,
+            'sender': f"{self.ip}:{self.port}",
+            'message_id': str(uuid.uuid4()),
+            'timestamp': time.time(),
+            'content': content
+        }
+        if group_name:
+            payload['group'] = group_name
+        payload.update(extra_fields)
+        return payload
+
+    def _send_response(self, conn, msg_type, message_id=None, error=None):
+        response = {
+            'type': msg_type,
+            'message_id': message_id,
+            'timestamp': time.time()
+        }
+        if error:
+            response['error'] = error
+        conn.send(json.dumps(response).encode('utf-8'))
+
+    def _validate_message(self, msg):
+        if not isinstance(msg, dict):
+            return False, "Message must be a JSON object"
+        if not msg.get('type'):
+            return False, "Missing message type"
+        tracked_types = ('CHAT', 'GROUP_CHAT', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER')
+        if msg['type'] in tracked_types:
+            for field in ('sender', 'message_id', 'timestamp'):
+                if field not in msg:
+                    return False, f"Missing field: {field}"
+        if msg['type'] in ('CHAT', 'GROUP_CHAT') and 'content' not in msg:
+            return False, "Missing field: content"
+        if msg['type'] in ('GROUP_CHAT', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER') and 'group' not in msg:
+            return False, "Missing field: group"
+        return True, None
+
     def start_server(self):
         """Vai trò Server: Lắng nghe tin nhắn đến đồng thời với việc gửi đi"""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -31,9 +71,13 @@ class Peer:
 
     def handle_incoming(self, conn, addr):
         try:
-            data = conn.recv(1024).decode('utf-8')
+            data = conn.recv(4096).decode('utf-8')
             if data:
                 msg = json.loads(data)
+                is_valid, error = self._validate_message(msg)
+                if not is_valid:
+                    self._send_response(conn, 'ERROR', msg.get('message_id'), error)
+                    return
                 if msg['type'] == 'CHAT':
                     self.ui_queue.put(('chat', f"[Tin nhắn 1-1 từ {msg['sender']}]: {msg['content']}"))
                 elif msg['type'] == 'GROUP_CHAT':
@@ -56,8 +100,16 @@ class Peer:
                         if group in self.my_groups:
                             self.my_groups[group]['members'].add(new_member)
                     self.ui_queue.put(('chat', f"[*] {new_member[0]}:{new_member[1]} đã tham gia nhóm '{group}'."))
+                else:
+                    self._send_response(conn, 'ERROR', msg.get('message_id'), f"Unsupported message type: {msg['type']}")
+                    return
+
+                self._send_response(conn, 'ACK', msg.get('message_id'))
         except Exception as e:
-            pass
+            try:
+                self._send_response(conn, 'ERROR', None, str(e))
+            except Exception:
+                pass
         finally:
             conn.close()
 
@@ -92,21 +144,27 @@ class Peer:
             s.settimeout(3)
             s.connect((target_ip, target_port))
             s.send(json.dumps(payload).encode('utf-8'))
+            response_data = s.recv(4096).decode('utf-8')
             s.close()
-            return True
+            if not response_data:
+                return False
+            response = json.loads(response_data)
+            if response.get('type') == 'ACK' and response.get('message_id') == payload.get('message_id'):
+                return True
+            if response.get('type') == 'ERROR':
+                self.ui_queue.put(('chat', f"[!] Peer {target_ip}:{target_port} bao loi: {response.get('error', 'Khong ro loi')}"))
+            return False
         except socket.error:
             if payload.get('type') in ('CHAT', 'GROUP_CHAT'):
                 self.ui_queue.put(('chat', f"[!] Giao tiếp thất bại với {target_ip}:{target_port}."))
             return False
 
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.ui_queue.put(('chat', f"[!] Phan hoi khong hop le tu {target_ip}:{target_port}."))
+            return False
+
     def send_message(self, target_ip, target_port, content, msg_type='CHAT', group_name=None):
-        payload = {
-            'type': msg_type,
-            'sender': f"{self.ip}:{self.port}",
-            'content': content
-        }
-        if group_name:
-            payload['group'] = group_name
+        payload = self._make_message(msg_type, content=content, group_name=group_name)
         return self._send_payload(target_ip, target_port, payload)
         
     def create_group(self, group_name):
@@ -142,26 +200,27 @@ class Peer:
                 new_member = (sender_ip, sender_port)
                 for member_ip, member_port in self.my_groups[group_name]['members']:
                     if (member_ip, member_port) != (self.ip, self.port):
-                        self._send_payload(member_ip, member_port, {
-                            'type': 'NEW_MEMBER',
-                            'group': group_name,
-                            'new_member': new_member
-                        })
+                        self._send_payload(
+                            member_ip,
+                            member_port,
+                            self._make_message('NEW_MEMBER', group_name=group_name, new_member=new_member)
+                        )
                 
                 self.my_groups[group_name]['members'].add(new_member)
                 
-                self._send_payload(sender_ip, sender_port, {
-                    'type': 'JOIN_ACCEPT',
-                    'group': group_name,
-                    'members': list(self.my_groups[group_name]['members'])
-                })
+                self._send_payload(
+                    sender_ip,
+                    sender_port,
+                    self._make_message('JOIN_ACCEPT', group_name=group_name, members=list(self.my_groups[group_name]['members']))
+                )
                 self.ui_queue.put(('chat', f"[*] Đã chấp nhận {sender_ip}:{sender_port} vào nhóm '{group_name}'."))
 
     def reject_join_request(self, sender_ip, sender_port, group_name):
-        self._send_payload(sender_ip, sender_port, {
-            'type': 'JOIN_REJECT',
-            'group': group_name
-        })
+        self._send_payload(
+            sender_ip,
+            sender_port,
+            self._make_message('JOIN_REJECT', group_name=group_name)
+        )
 
     def start_threads(self):
         threading.Thread(target=self.start_server, daemon=True).start()
