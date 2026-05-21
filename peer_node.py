@@ -10,6 +10,8 @@ import queue
 
 BOOTSTRAP_IP = '127.0.0.1'
 BOOTSTRAP_PORT = 5000
+SEND_RETRIES = 3
+RETRYABLE_MESSAGE_TYPES = ('CHAT', 'GROUP_CHAT', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER')
 
 class Peer:
     def __init__(self, port, ui_queue):
@@ -138,30 +140,51 @@ class Peer:
                 s.close()
             time.sleep(5)  # Gửi heartbeat (nhịp tim) mỗi 5 giây
 
-    def _send_payload(self, target_ip, target_port, payload):
+    def _send_payload_once(self, target_ip, target_port, payload):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(3)
             s.connect((target_ip, target_port))
             s.send(json.dumps(payload).encode('utf-8'))
             response_data = s.recv(4096).decode('utf-8')
+        finally:
             s.close()
-            if not response_data:
-                return False
-            response = json.loads(response_data)
-            if response.get('type') == 'ACK' and response.get('message_id') == payload.get('message_id'):
-                return True
-            if response.get('type') == 'ERROR':
-                self.ui_queue.put(('chat', f"[!] Peer {target_ip}:{target_port} bao loi: {response.get('error', 'Khong ro loi')}"))
-            return False
-        except socket.error:
-            if payload.get('type') in ('CHAT', 'GROUP_CHAT'):
-                self.ui_queue.put(('chat', f"[!] Giao tiếp thất bại với {target_ip}:{target_port}."))
-            return False
 
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self.ui_queue.put(('chat', f"[!] Phan hoi khong hop le tu {target_ip}:{target_port}."))
-            return False
+        if not response_data:
+            return False, "Khong nhan duoc phan hoi"
+
+        response = json.loads(response_data)
+        if response.get('type') == 'ACK' and response.get('message_id') == payload.get('message_id'):
+            return True, None
+        if response.get('type') == 'ERROR':
+            return False, response.get('error', 'Khong ro loi')
+        return False, "Phan hoi khong hop le"
+
+    def _send_payload(self, target_ip, target_port, payload):
+        max_attempts = SEND_RETRIES if payload.get('type') in RETRYABLE_MESSAGE_TYPES else 1
+        last_error = "Khong ro loi"
+
+        for attempt in range(1, max_attempts + 1):
+            should_retry = attempt < max_attempts
+            try:
+                success, error = self._send_payload_once(target_ip, target_port, payload)
+                if success:
+                    return True
+                last_error = error or last_error
+                if error and error not in ("Khong nhan duoc phan hoi", "Phan hoi khong hop le"):
+                    self.ui_queue.put(('chat', f"[!] Peer {target_ip}:{target_port} bao loi: {last_error}"))
+                    return False
+            except (socket.error, socket.timeout) as e:
+                last_error = str(e) or "Loi ket noi"
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                last_error = "Phan hoi khong hop le"
+
+            if should_retry:
+                time.sleep(0.2)
+
+        if payload.get('type') in RETRYABLE_MESSAGE_TYPES:
+            self.ui_queue.put(('chat', f"[!] Gui that bai sau {max_attempts} lan toi {target_ip}:{target_port}: {last_error}"))
+        return False
 
     def send_message(self, target_ip, target_port, content, msg_type='CHAT', group_name=None):
         payload = self._make_message(msg_type, content=content, group_name=group_name)
@@ -191,7 +214,10 @@ class Peer:
                 return
             leader_ip, leader_port = self.available_groups[group_name]
             
-        self.send_message(leader_ip, leader_port, content="", msg_type='JOIN_REQUEST', group_name=group_name)
+        join_request_sent = self.send_message(leader_ip, leader_port, content="", msg_type='JOIN_REQUEST', group_name=group_name)
+        if not join_request_sent:
+            self.ui_queue.put(('chat', f"[!] Khong gui duoc yeu cau tham gia nhom '{group_name}' toi truong nhom."))
+            return
         self.ui_queue.put(('chat', f"[*] Đã gửi yêu cầu tham gia nhóm '{group_name}' tới trưởng nhóm."))
 
     def accept_join_request(self, sender_ip, sender_port, group_name):
