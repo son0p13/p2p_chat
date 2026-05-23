@@ -11,7 +11,7 @@ import queue
 BOOTSTRAP_IP = '127.0.0.1'
 BOOTSTRAP_PORT = 5000
 SEND_RETRIES = 3
-RETRYABLE_MESSAGE_TYPES = ('CHAT', 'GROUP_CHAT', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER')
+RETRYABLE_MESSAGE_TYPES = ('CHAT', 'GROUP_CHAT', 'BROADCAST', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER')
 
 class Peer:
     def __init__(self, port, ui_queue):
@@ -51,12 +51,12 @@ class Peer:
             return False, "Message must be a JSON object"
         if not msg.get('type'):
             return False, "Missing message type"
-        tracked_types = ('CHAT', 'GROUP_CHAT', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER')
+        tracked_types = ('CHAT', 'GROUP_CHAT', 'BROADCAST', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER')
         if msg['type'] in tracked_types:
             for field in ('sender', 'message_id', 'timestamp'):
                 if field not in msg:
                     return False, f"Missing field: {field}"
-        if msg['type'] in ('CHAT', 'GROUP_CHAT') and 'content' not in msg:
+        if msg['type'] in ('CHAT', 'GROUP_CHAT', 'BROADCAST') and 'content' not in msg:
             return False, "Missing field: content"
         if msg['type'] in ('GROUP_CHAT', 'JOIN_REQUEST', 'JOIN_ACCEPT', 'JOIN_REJECT', 'NEW_MEMBER') and 'group' not in msg:
             return False, "Missing field: group"
@@ -84,6 +84,8 @@ class Peer:
                     self.ui_queue.put(('chat', f"[Tin nhắn 1-1 từ {msg['sender']}]: {msg['content']}"))
                 elif msg['type'] == 'GROUP_CHAT':
                     self.ui_queue.put(('chat', f"[Nhóm '{msg['group']}' - từ {msg['sender']}]: {msg['content']}"))
+                elif msg['type'] == 'BROADCAST':
+                    self.ui_queue.put(('chat', f"[Broadcast từ {msg['sender']}]: {msg['content']}"))
                 elif msg['type'] == 'JOIN_REQUEST':
                     sender_ip, sender_port = msg['sender'].split(':')
                     self.ui_queue.put(('join_request', {'sender_ip': sender_ip, 'sender_port': int(sender_port), 'group': msg['group']}))
@@ -189,6 +191,28 @@ class Peer:
     def send_message(self, target_ip, target_port, content, msg_type='CHAT', group_name=None):
         payload = self._make_message(msg_type, content=content, group_name=group_name)
         return self._send_payload(target_ip, target_port, payload)
+
+    def broadcast_message(self, content):
+        with self.lock:
+            peers = list(self.known_peers)
+
+        targets = [
+            (peer_ip, peer_port)
+            for peer_ip, peer_port in peers
+            if (peer_ip, peer_port) != (self.ip, self.port)
+        ]
+        if not targets:
+            return 0, 0
+
+        success_count = 0
+        failure_count = 0
+        payload = self._make_message('BROADCAST', content=content)
+        for peer_ip, peer_port in targets:
+            if self._send_payload(peer_ip, peer_port, payload):
+                success_count += 1
+            else:
+                failure_count += 1
+        return success_count, failure_count
         
     def create_group(self, group_name):
         try:
@@ -286,6 +310,7 @@ class ChatGUI:
         tk.Label(msg_frame, text="Tin nhắn:").pack(side=tk.LEFT)
         self.msg_entry = tk.Entry(msg_frame)
         self.msg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        tk.Button(msg_frame, text="Gửi Broadcast", command=self.send_broadcast).pack(side=tk.LEFT)
         
         # Khung gửi 1-1
         direct_frame = tk.Frame(left_frame)
@@ -374,6 +399,26 @@ class ChatGUI:
         self.chat_display.config(state='disabled')
         self.chat_display.yview(tk.END)
         self.peer.send_message(ip, port, msg)
+        self.msg_entry.delete(0, tk.END)
+
+    def send_broadcast(self):
+        msg = self.msg_entry.get()
+        if not msg:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập Tin nhắn!")
+            return
+
+        success_count, failure_count = self.peer.broadcast_message(msg)
+        if success_count == 0 and failure_count == 0:
+            messagebox.showwarning("Lỗi", "Chưa có peer khác online để broadcast!")
+            return
+
+        self.chat_display.config(state='normal')
+        self.chat_display.insert(
+            tk.END,
+            f"[Bạn -> Broadcast]: {msg} (thành công: {success_count}, thất bại: {failure_count})\n"
+        )
+        self.chat_display.config(state='disabled')
+        self.chat_display.yview(tk.END)
         self.msg_entry.delete(0, tk.END)
 
     def create_group(self):
