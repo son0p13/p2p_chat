@@ -56,3 +56,6 @@ o	kiến trúc hệ thống
 o	giao thức trao đổi thông điệp
 o	cơ chế peer discovery
 o	xử lý lỗi và thử nghiệm hệ thống.
+
+
+

@@ -12,17 +12,41 @@ BOOTSTRAP_PORT = 5000
 
 class Peer:
     def __init__(self, port, ui_queue):
-        self.ip = '127.0.0.1'
+        # Fix lỗi 5: tự động detect IP thực thay vì hardcode 127.0.0.1
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            self.ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            self.ip = '127.0.0.1'
+
         self.port = port
         self.known_peers = []
-        self.available_groups = {} # group_name -> (leader_ip, leader_port)
-        self.my_groups = {} # group_name -> {'members': set of (ip, port), 'is_leader': bool}
+        self.available_groups = {}  # group_name -> (leader_ip, leader_port)
+        self.my_groups = {}         # group_name -> {'members': set of (ip, port), 'is_leader': bool}
         self.lock = threading.Lock()
         self.ui_queue = ui_queue
+
+    def recv_full(self, conn):
+        """Fix lỗi 3: Đọc toàn bộ dữ liệu cho đến khi parse JSON thành công"""
+        chunks = []
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            try:
+                json.loads(b''.join(chunks).decode('utf-8'))
+                break
+            except json.JSONDecodeError:
+                continue
+        return b''.join(chunks).decode('utf-8')
 
     def start_server(self):
         """Vai trò Server: Lắng nghe tin nhắn đến đồng thời với việc gửi đi"""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(('0.0.0.0', self.port))
         server.listen(5)
         while True:
@@ -31,7 +55,7 @@ class Peer:
 
     def handle_incoming(self, conn, addr):
         try:
-            data = conn.recv(1024).decode('utf-8')
+            data = self.recv_full(conn)  # Fix lỗi 3: thay recv(1024)
             if data:
                 msg = json.loads(data)
                 if msg['type'] == 'CHAT':
@@ -40,7 +64,10 @@ class Peer:
                     self.ui_queue.put(('chat', f"[Nhóm '{msg['group']}' - từ {msg['sender']}]: {msg['content']}"))
                 elif msg['type'] == 'JOIN_REQUEST':
                     sender_ip, sender_port = msg['sender'].split(':')
-                    self.ui_queue.put(('join_request', {'sender_ip': sender_ip, 'sender_port': int(sender_port), 'group': msg['group']}))
+                    self.ui_queue.put(('join_request', {
+                        'sender_ip': sender_ip,
+                        'sender_port': int(sender_port),
+                        'group': msg['group']}))
                 elif msg['type'] == 'JOIN_ACCEPT':
                     group = msg['group']
                     members = set([tuple(m) for m in msg['members']])
@@ -56,20 +83,24 @@ class Peer:
                         if group in self.my_groups:
                             self.my_groups[group]['members'].add(new_member)
                     self.ui_queue.put(('chat', f"[*] {new_member[0]}:{new_member[1]} đã tham gia nhóm '{group}'."))
+        except json.JSONDecodeError:
+            print(f"[!] handle_incoming: JSON không hợp lệ từ {addr}")
+        except KeyError as e:
+            print(f"[!] handle_incoming: thiếu trường {e} từ {addr}")
         except Exception as e:
-            pass
+            print(f"[!] handle_incoming: lỗi từ {addr}: {e}")
         finally:
             conn.close()
 
     def heartbeat_loop(self):
         """Yêu cầu 3.4 & 3.5: Cơ chế Peer Discovery và Cập nhật trạng thái liên tục"""
         while True:
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(2)
                 s.connect((BOOTSTRAP_IP, BOOTSTRAP_PORT))
                 s.send(json.dumps({'type': 'HEARTBEAT', 'port': self.port}).encode('utf-8'))
-                
                 response = s.recv(4096).decode('utf-8')
                 if response:
                     msg = json.loads(response)
@@ -80,11 +111,12 @@ class Peer:
                                 self.available_groups = {g: tuple(addr) for g, addr in msg['groups'].items()}
                         self.ui_queue.put(('peers', self.known_peers))
                         self.ui_queue.put(('groups', self.available_groups))
-            except Exception as e:
+            except Exception:
                 pass
             finally:
-                s.close()
-            time.sleep(5)  # Gửi heartbeat (nhịp tim) mỗi 5 giây
+                if s:
+                    s.close()
+            time.sleep(5)
 
     def _send_payload(self, target_ip, target_port, payload):
         try:
@@ -108,15 +140,18 @@ class Peer:
         if group_name:
             payload['group'] = group_name
         return self._send_payload(target_ip, target_port, payload)
-        
+
     def create_group(self, group_name):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect((BOOTSTRAP_IP, BOOTSTRAP_PORT))
             s.send(json.dumps({'type': 'CREATE_GROUP', 'port': self.port, 'group': group_name}).encode('utf-8'))
-            s.recv(4096)
+            response = json.loads(s.recv(4096).decode('utf-8'))
             s.close()
+            if response.get('type') == 'CREATE_GROUP_ERROR':
+                self.ui_queue.put(('chat', f"[!] {response['reason']}"))
+                return False
             with self.lock:
                 self.my_groups[group_name] = {'members': {(self.ip, self.port)}, 'is_leader': True}
             return True
@@ -132,30 +167,33 @@ class Peer:
                 self.ui_queue.put(('chat', f"[!] Nhóm '{group_name}' không tồn tại."))
                 return
             leader_ip, leader_port = self.available_groups[group_name]
-            
         self.send_message(leader_ip, leader_port, content="", msg_type='JOIN_REQUEST', group_name=group_name)
         self.ui_queue.put(('chat', f"[*] Đã gửi yêu cầu tham gia nhóm '{group_name}' tới trưởng nhóm."))
 
     def accept_join_request(self, sender_ip, sender_port, group_name):
+        # Fix lỗi 1: tách I/O ra ngoài lock, tránh deadlock
+        members_to_notify = []
+        new_member = (sender_ip, sender_port)
         with self.lock:
-            if group_name in self.my_groups and self.my_groups[group_name]['is_leader']:
-                new_member = (sender_ip, sender_port)
-                for member_ip, member_port in self.my_groups[group_name]['members']:
-                    if (member_ip, member_port) != (self.ip, self.port):
-                        self._send_payload(member_ip, member_port, {
-                            'type': 'NEW_MEMBER',
-                            'group': group_name,
-                            'new_member': new_member
-                        })
-                
-                self.my_groups[group_name]['members'].add(new_member)
-                
-                self._send_payload(sender_ip, sender_port, {
-                    'type': 'JOIN_ACCEPT',
+            if group_name not in self.my_groups or not self.my_groups[group_name]['is_leader']:
+                return
+            members_to_notify = list(self.my_groups[group_name]['members'])
+            self.my_groups[group_name]['members'].add(new_member)
+
+        for member_ip, member_port in members_to_notify:
+            if (member_ip, member_port) != (self.ip, self.port):
+                self._send_payload(member_ip, member_port, {
+                    'type': 'NEW_MEMBER',
                     'group': group_name,
-                    'members': list(self.my_groups[group_name]['members'])
+                    'new_member': list(new_member)
                 })
-                self.ui_queue.put(('chat', f"[*] Đã chấp nhận {sender_ip}:{sender_port} vào nhóm '{group_name}'."))
+
+        self._send_payload(sender_ip, sender_port, {
+            'type': 'JOIN_ACCEPT',
+            'group': group_name,
+            'members': [list(m) for m in members_to_notify + [new_member]]
+        })
+        self.ui_queue.put(('chat', f"[*] Đã chấp nhận {sender_ip}:{sender_port} vào nhóm '{group_name}'."))
 
     def reject_join_request(self, sender_ip, sender_port, group_name):
         self._send_payload(sender_ip, sender_port, {
@@ -168,41 +206,34 @@ class Peer:
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
         self.ui_queue.put(('chat', f"[*] Peer khởi chạy thành công tại {self.ip}:{self.port}"))
 
+
 class ChatGUI:
     def __init__(self, root, port):
         self.root = root
         self.root.title(f"P2P Chat Node - Port {port}")
         self.root.geometry("600x450")
-        
         self.ui_queue = queue.Queue()
         self.peer = Peer(port, self.ui_queue)
-        
         self.setup_ui()
         self.peer.start_threads()
         self.process_queue()
 
     def setup_ui(self):
-        # --- Bố cục chính ---
-        # Khung danh sách Peer bên phải (được pack trước để cố định chiều rộng)
         right_frame = tk.Frame(self.root)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
 
-        # Khung chat bên trái
         left_frame = tk.Frame(self.root)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=10)
-        
-        # --- Các thành phần trong khung bên trái (left_frame) ---
+
         self.chat_display = scrolledtext.ScrolledText(left_frame, state='disabled', height=15)
         self.chat_display.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # Khung nhập tin nhắn
+
         msg_frame = tk.Frame(left_frame)
         msg_frame.pack(fill=tk.X, pady=2)
         tk.Label(msg_frame, text="Tin nhắn:").pack(side=tk.LEFT)
         self.msg_entry = tk.Entry(msg_frame)
         self.msg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        # Khung gửi 1-1
+
         direct_frame = tk.Frame(left_frame)
         direct_frame.pack(fill=tk.X, pady=2)
         tk.Label(direct_frame, text="IP:").pack(side=tk.LEFT)
@@ -213,8 +244,7 @@ class ChatGUI:
         self.port_entry = tk.Entry(direct_frame, width=6)
         self.port_entry.pack(side=tk.LEFT, padx=5)
         tk.Button(direct_frame, text="Gửi 1-1", command=self.send_direct).pack(side=tk.LEFT, padx=5)
-        
-        # Khung gửi Nhóm
+
         group_frame = tk.Frame(left_frame)
         group_frame.pack(fill=tk.X, pady=2)
         tk.Label(group_frame, text="Tên nhóm:").pack(side=tk.LEFT)
@@ -224,18 +254,16 @@ class ChatGUI:
         tk.Button(group_frame, text="Xin vào", command=self.join_group).pack(side=tk.LEFT, padx=2)
         tk.Button(group_frame, text="Gửi Nhóm", command=self.send_group).pack(side=tk.LEFT, padx=2)
 
-        # --- Các thành phần trong khung bên phải (right_frame) ---
         tk.Label(right_frame, text="Peers Online").pack()
         self.peer_list = tk.Listbox(right_frame, width=20, height=10)
         self.peer_list.pack(fill=tk.Y, expand=True, pady=(0, 10))
         self.peer_list.bind('<<ListboxSelect>>', self.on_peer_select)
-        
+
         tk.Label(right_frame, text="Nhóm hiện có").pack()
         self.group_list = tk.Listbox(right_frame, width=20, height=10)
         self.group_list.pack(fill=tk.Y, expand=True)
 
     def process_queue(self):
-        """Hàm cập nhật giao diện định kỳ mà không block luồng xử lý chính"""
         try:
             while True:
                 msg_type, data = self.ui_queue.get_nowait()
@@ -262,11 +290,9 @@ class ChatGUI:
                         self.peer.reject_join_request(sender_ip, sender_port, group)
         except queue.Empty:
             pass
-        # Cứ 100ms kiểm tra hàng đợi một lần
         self.root.after(100, self.process_queue)
 
     def on_peer_select(self, event):
-        """Tự động điền IP và Port khi click vào một peer trong danh sách"""
         selection = self.peer_list.curselection()
         if selection:
             peer_info = self.peer_list.get(selection[0])
@@ -302,7 +328,7 @@ class ChatGUI:
             self.chat_display.config(state='disabled')
             self.chat_display.yview(tk.END)
         else:
-            messagebox.showerror("Lỗi", "Không thể kết nối đến Bootstrap Server!")
+            messagebox.showerror("Lỗi", "Không thể tạo nhóm (đã tồn tại hoặc lỗi kết nối)!")
 
     def join_group(self):
         grp = self.group_entry.get()
@@ -317,22 +343,27 @@ class ChatGUI:
         if not grp or not msg:
             messagebox.showwarning("Lỗi", "Vui lòng nhập Tên nhóm và Tin nhắn!")
             return
-        
+
         with self.peer.lock:
             if grp not in self.peer.my_groups:
                 messagebox.showwarning("Lỗi", f"Bạn chưa tham gia nhóm '{grp}'!")
                 return
             peers = list(self.peer.my_groups[grp]['members'])
-            
+
         self.chat_display.config(state='normal')
         self.chat_display.insert(tk.END, f"[Bạn -> Nhóm '{grp}']: {msg}\n")
         self.chat_display.config(state='disabled')
         self.chat_display.yview(tk.END)
-        
-        for peer_ip, peer_port in peers:
-            if (peer_ip, peer_port) != (self.peer.ip, self.peer.port):
-                self.peer.send_message(peer_ip, peer_port, msg, msg_type='GROUP_CHAT', group_name=grp)
+
+        # Fix lỗi 4: chạy vòng lặp gửi trong thread riêng, không block GUI
+        def _do_send(peer_list, grp, msg):
+            for peer_ip, peer_port in peer_list:
+                if (peer_ip, peer_port) != (self.peer.ip, self.peer.port):
+                    self.peer.send_message(peer_ip, peer_port, msg, msg_type='GROUP_CHAT', group_name=grp)
+
+        threading.Thread(target=_do_send, args=(peers, grp, msg), daemon=True).start()
         self.msg_entry.delete(0, tk.END)
+
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 6001
